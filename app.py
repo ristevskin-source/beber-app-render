@@ -1,5 +1,5 @@
 import streamlit as st
-import sqlite3
+import psycopg2
 import os
 from datetime import datetime, timedelta
 
@@ -9,13 +9,25 @@ BROJ_DANA = 7
 PAUZA_POCETAK = 12
 PAUZA_KRAJ = 13
 
+DATABASE_URL = "postgresql://postgres:TVOJA_LOZINKA@db.TVOJ_ID.supabase.co:5432/postgres"
+
+def get_db():
+    return psycopg2.connect(DATABASE_URL)
+
 def init_db():
-    conn = sqlite3.connect('termini.db')
+    conn = get_db()
     c = conn.cursor()
     
-    c.execute('''CREATE TABLE IF NOT EXISTS rezervacije 
-                 (id INTEGER PRIMARY KEY, usluga TEXT, datum TEXT, vreme TEXT, 
-                  ime TEXT, telefon TEXT, cena INTEGER, naplaceno INTEGER DEFAULT 0, datum_naplate TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS rezervacije (
+                 id SERIAL PRIMARY KEY, 
+                 usluga TEXT, 
+                 datum TEXT, 
+                 vreme TEXT, 
+                 ime TEXT, 
+                 telefon TEXT, 
+                 cena INTEGER, 
+                 naplaceno INTEGER DEFAULT 0, 
+                 datum_naplate TEXT)''')
     
     c.execute('''CREATE TABLE IF NOT EXISTS cenovnik (
                     usluga TEXT PRIMARY KEY, 
@@ -32,15 +44,19 @@ def init_db():
         ('🧔 Brada (samo)', 1000, 30),
         ('✨ Obrve (samo)', 400, 15)
     ]
-    c.executemany("INSERT OR IGNORE INTO cenovnik (usluga, cena, trajanje) VALUES (?, ?, ?)", usluge)
+    for u in usluge:
+        c.execute("INSERT INTO cenovnik (usluga, cena, trajanje) VALUES (%s, %s, %s) ON CONFLICT (usluga) DO NOTHING", u)
     
     c.execute('''CREATE TABLE IF NOT EXISTS konfiguracija (lozinka TEXT)''')
     c.execute("SELECT * FROM konfiguracija")
     if not c.fetchone():
         c.execute("INSERT INTO konfiguracija (lozinka) VALUES ('1234')")
     
-    c.execute('''CREATE TABLE IF NOT EXISTS pauze 
-                 (id INTEGER PRIMARY KEY, datum TEXT, vreme TEXT, napomena TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS pauze (
+                 id SERIAL PRIMARY KEY, 
+                 datum TEXT, 
+                 vreme TEXT, 
+                 napomena TEXT)''')
     
     conn.commit()
     conn.close()
@@ -71,17 +87,17 @@ def generisi_slotove_za_dan(datum_str):
     if dan.weekday() == 6:
         return
     
-    conn = sqlite3.connect('termini.db')
+    conn = get_db()
     c = conn.cursor()
     
-    c.execute("DELETE FROM rezervacije WHERE datum=? AND ime IS NULL", (datum_str,))
+    c.execute("DELETE FROM rezervacije WHERE datum=%s AND ime IS NULL", (datum_str,))
     
     sat_start, min_start = RADNO_VREME[0]
     sat_kraj, min_kraj = RADNO_VREME[1]
     trenutno = datetime.strptime(datum_str, "%Y-%m-%d").replace(hour=sat_start, minute=min_start)
     kraj = datetime.strptime(datum_str, "%Y-%m-%d").replace(hour=sat_kraj, minute=min_kraj)
     
-    c.execute("SELECT vreme FROM pauze WHERE datum=?", (datum_str,))
+    c.execute("SELECT vreme FROM pauze WHERE datum=%s", (datum_str,))
     pauze = [row[0] for row in c.fetchall()]
     for i in range(PAUZA_POCETAK*4, PAUZA_KRAJ*4):
         vreme = f"{i//4:02d}:{(i%4)*15:02d}"
@@ -96,7 +112,8 @@ def generisi_slotove_za_dan(datum_str):
         trenutno += timedelta(minutes=INTERVAL_MIN)
     
     if slotovi:
-        c.executemany("INSERT INTO rezervacije (usluga, datum, vreme, ime, telefon, cena, naplaceno, datum_naplate) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", slotovi)
+        for s in slotovi:
+            c.execute("INSERT INTO rezervacije (usluga, datum, vreme, ime, telefon, cena, naplaceno, datum_naplate) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)", s)
         conn.commit()
     conn.close()
 
@@ -107,32 +124,32 @@ def osvezi_termine():
     return True
 
 def rezervisi_blok(datum, pocetak, trajanje, ime, telefon, usluga, cena):
-    conn = sqlite3.connect('termini.db')
+    conn = get_db()
     c = conn.cursor()
     
     c.execute("""
         INSERT INTO rezervacije (usluga, datum, vreme, ime, telefon, cena, naplaceno, datum_naplate)
-        VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, 0, %s)
     """, (usluga, datum, pocetak, ime, telefon, cena, None))
     
     conn.commit()
     conn.close()
     
-    conn2 = sqlite3.connect('termini.db')
+    conn2 = get_db()
     c2 = conn2.cursor()
-    c2.execute("SELECT COUNT(*) FROM rezervacije WHERE ime=? AND datum=? AND vreme=?", (ime, datum, pocetak))
+    c2.execute("SELECT COUNT(*) FROM rezervacije WHERE ime=%s AND datum=%s AND vreme=%s", (ime, datum, pocetak))
     count = c2.fetchone()[0]
     conn2.close()
     
     return count > 0
 
 def prikazi_tabelu_termina(datum, usluga_trajanje):
-    conn = sqlite3.connect('termini.db')
+    conn = get_db()
     c = conn.cursor()
     
     c.execute("""
         SELECT vreme, ime FROM rezervacije 
-        WHERE datum=? 
+        WHERE datum=%s 
         ORDER BY vreme ASC
     """, (datum,))
     svi_slotovi = c.fetchall()
@@ -201,7 +218,7 @@ with tab1:
             st.session_state['booking_success'] = False
             st.rerun()
     else:
-        conn = sqlite3.connect('termini.db')
+        conn = get_db()
         c = conn.cursor()
         datumi_raw = generisi_datume()
         c.execute("SELECT usluga, cena, trajanje FROM cenovnik ORDER BY trajanje ASC")
@@ -269,7 +286,7 @@ with tab2:
         col1, col2 = st.columns(2)
         with col1:
             if st.button("🧹 Očisti sve termine (reset)"):
-                conn = sqlite3.connect('termini.db')
+                conn = get_db()
                 c = conn.cursor()
                 c.execute("UPDATE rezervacije SET ime=NULL, telefon=NULL, usluga=NULL, cena=NULL, naplaceno=0")
                 conn.commit()
@@ -287,29 +304,14 @@ with tab2:
         
         st.divider()
         
-        # 🔥 DEBUG
-        st.subheader("🔍 DEBUG - Svi podaci iz baze")
-        conn = sqlite3.connect('termini.db')
-        c = conn.cursor()
-        c.execute("SELECT * FROM rezervacije ORDER BY datum, vreme")
-        svi = c.fetchall()
-        if svi:
-            st.write("📋 Svi redovi u bazi:")
-            for red in svi:
-                st.write(red)
-        else:
-            st.info("📭 Baza je prazna.")
-        conn.close()
-        st.divider()
-        
-        conn = sqlite3.connect('termini.db')
+        conn = get_db()
         c = conn.cursor()
         today = datetime.now().strftime("%Y-%m-%d")
         
         c.execute("""
             SELECT COUNT(DISTINCT ime || '|' || telefon || '|' || datum || '|' || usluga) 
             FROM rezervacije 
-            WHERE datum=? AND ime IS NOT NULL
+            WHERE datum=%s AND ime IS NOT NULL
         """, (today,))
         danas_klijenata = c.fetchone()[0] or 0
         
@@ -328,13 +330,13 @@ with tab2:
         
         this_month = datetime.now().strftime("%Y-%m")
         
-        conn = sqlite3.connect('termini.db')
+        conn = get_db()
         c = conn.cursor()
         
-        c.execute("SELECT sum(cena) FROM rezervacije WHERE naplaceno=1 AND datum_naplate=?", (today,))
+        c.execute("SELECT sum(cena) FROM rezervacije WHERE naplaceno=1 AND datum_naplate=%s", (today,))
         danas_promet = c.fetchone()[0] or 0
         
-        c.execute("SELECT sum(cena) FROM rezervacije WHERE naplaceno=1 AND datum_naplate LIKE ?", (f"{this_month}%",))
+        c.execute("SELECT sum(cena) FROM rezervacije WHERE naplaceno=1 AND datum_naplate LIKE %s", (f"{this_month}%",))
         mesec_promet = c.fetchone()[0] or 0
         
         c.execute("SELECT sum(cena) FROM rezervacije WHERE naplaceno=1")
@@ -352,7 +354,7 @@ with tab2:
         
         st.subheader("📈 Promet po mesecima")
         
-        conn = sqlite3.connect('termini.db')
+        conn = get_db()
         c = conn.cursor()
         c.execute("SELECT DISTINCT substr(datum_naplate,1,7) FROM rezervacije WHERE naplaceno=1 AND datum_naplate IS NOT NULL ORDER BY datum_naplate DESC")
         dostupni_meseci = [row[0] for row in c.fetchall()]
@@ -361,9 +363,9 @@ with tab2:
         if dostupni_meseci:
             izabrani_mesec = st.selectbox("Izaberite mesec", dostupni_meseci, index=0)
             
-            conn = sqlite3.connect('termini.db')
+            conn = get_db()
             c = conn.cursor()
-            c.execute("SELECT sum(cena) FROM rezervacije WHERE naplaceno=1 AND datum_naplate LIKE ?", (f"{izabrani_mesec}%",))
+            c.execute("SELECT sum(cena) FROM rezervacije WHERE naplaceno=1 AND datum_naplate LIKE %s", (f"{izabrani_mesec}%",))
             promet_mesec = c.fetchone()[0] or 0
             conn.close()
             
@@ -373,12 +375,12 @@ with tab2:
         
         st.subheader("📋 Zakazani klijenti")
         
-        conn = sqlite3.connect('termini.db')
+        conn = get_db()
         c = conn.cursor()
         c.execute("""
             SELECT ime, telefon, usluga, cena, datum, 
                    MIN(vreme) as pocetak, MAX(vreme) as kraj,
-                   GROUP_CONCAT(id) as ids,
+                   array_agg(id) as ids,
                    COUNT(*) as broj_slotova
             FROM rezervacije 
             WHERE ime IS NOT NULL 
@@ -411,10 +413,10 @@ with tab2:
                         <span>
                 """, unsafe_allow_html=True)
                 
-                first_id = int(ids.split(',')[0])
-                conn2 = sqlite3.connect('termini.db')
+                first_id = ids[0]
+                conn2 = get_db()
                 c2 = conn2.cursor()
-                c2.execute("SELECT naplaceno FROM rezervacije WHERE id=?", (first_id,))
+                c2.execute("SELECT naplaceno FROM rezervacije WHERE id=%s", (first_id,))
                 naplaceno = c2.fetchone()[0]
                 conn2.close()
                 
@@ -422,19 +424,19 @@ with tab2:
                     st.markdown('<span style="color: #4ac24a;">✅ Naplaćeno</span>', unsafe_allow_html=True)
                 else:
                     if st.button(f"💰 Naplati", key=f"pay_{idx}"):
-                        conn3 = sqlite3.connect('termini.db')
+                        conn3 = get_db()
                         c3 = conn3.cursor()
-                        for id in ids.split(','):
-                            c3.execute("UPDATE rezervacije SET naplaceno=1, datum_naplate=? WHERE id=?", (datetime.now().strftime("%Y-%m-%d"), int(id)))
+                        for id in ids:
+                            c3.execute("UPDATE rezervacije SET naplaceno=1, datum_naplate=%s WHERE id=%s", (datetime.now().strftime("%Y-%m-%d"), id))
                         conn3.commit()
                         conn3.close()
                         st.success(f"✅ Naplaćeno: {ime}")
                         st.rerun()
                     if st.button(f"🗑️ Otkaži", key=f"cancel_{idx}"):
-                        conn4 = sqlite3.connect('termini.db')
+                        conn4 = get_db()
                         c4 = conn4.cursor()
-                        for id in ids.split(','):
-                            c4.execute("UPDATE rezervacije SET ime=NULL, telefon=NULL, usluga=NULL, cena=NULL, naplaceno=0 WHERE id=?", (int(id),))
+                        for id in ids:
+                            c4.execute("UPDATE rezervacije SET ime=NULL, telefon=NULL, usluga=NULL, cena=NULL, naplaceno=0 WHERE id=%s", (id,))
                         conn4.commit()
                         conn4.close()
                         st.success(f"🗑️ Otkazano: {ime}")
@@ -459,15 +461,15 @@ with tab2:
             with col3:
                 if st.form_submit_button("➕ Dodaj"):
                     if nova_usluga and nova_cena > 0:
-                        conn = sqlite3.connect('termini.db')
+                        conn = get_db()
                         c = conn.cursor()
-                        c.execute("INSERT OR IGNORE INTO cenovnik (usluga, cena, trajanje) VALUES (?, ?, ?)", (nova_usluga, nova_cena, 60))
+                        c.execute("INSERT INTO cenovnik (usluga, cena, trajanje) VALUES (%s, %s, %s) ON CONFLICT (usluga) DO NOTHING", (nova_usluga, nova_cena, 60))
                         conn.commit()
                         conn.close()
                         st.success(f"✅ Dodato: {nova_usluga} - {nova_cena} din")
                         st.rerun()
         
-        conn = sqlite3.connect('termini.db')
+        conn = get_db()
         c = conn.cursor()
         c.execute("SELECT usluga, cena, trajanje FROM cenovnik ORDER BY usluga")
         sve_usluge = c.fetchall()
@@ -485,9 +487,9 @@ with tab2:
                 with col4:
                     nova_cena = st.number_input(f"Nova cena", value=cena, step=100, key=f"cena_{usluga}")
                     if st.button(f"💾 Sačuvaj", key=f"save_{usluga}"):
-                        conn = sqlite3.connect('termini.db')
+                        conn = get_db()
                         c = conn.cursor()
-                        c.execute("UPDATE cenovnik SET cena=?, trajanje=? WHERE usluga=?", (nova_cena, novo_trajanje, usluga))
+                        c.execute("UPDATE cenovnik SET cena=%s, trajanje=%s WHERE usluga=%s", (nova_cena, novo_trajanje, usluga))
                         conn.commit()
                         conn.close()
                         st.success(f"✅ Usluga {usluga} ažurirana!")
